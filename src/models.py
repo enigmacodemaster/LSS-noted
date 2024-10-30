@@ -17,7 +17,7 @@ class Up(nn.Module):
         super().__init__()
 
         self.up = nn.Upsample(scale_factor=scale_factor, mode='bilinear',
-                              align_corners=True)  # 上采样 BxCxHxW->BxCx2Hx2W
+                              align_corners=True)  # 直接调用nn模块进行上采样 BxCxHxW->BxCx2Hx2W
 
         self.conv = nn.Sequential(  # 两个3x3卷积
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
@@ -29,12 +29,13 @@ class Up(nn.Module):
         )
 
     def forward(self, x1, x2):
-        x1 = self.up(x1)  # 对x1进行上采样
-        x1 = torch.cat([x2, x1], dim=1)  # 将x1和x2 concat 在一起
+        x1 = self.up(x1)  # 对x1进行上采样到和x2相同 h x w 维度
+        x1 = torch.cat([x2, x1], dim=1)  # 将x1和x2 特征图按照通道的维度 拼接在一起，得到更多特征通道，更丰富的特征表达
         return self.conv(x1)
 
-
-class CamEncode(nn.Module):  # 提取图像特征进行图像编码
+# 提取图像特征进行图像编码
+# 初始化参数，深度维度，图像特征维度，下采样倍数
+class CamEncode(nn.Module):  
     def __init__(self, D, C, downsample):
         super(CamEncode, self).__init__()
         self.D = D  # 41
@@ -60,16 +61,16 @@ class CamEncode(nn.Module):  # 提取图像特征进行图像编码
 
     def get_eff_depth(self, x):  # 使用efficientnet提取特征
         # adapted from https://github.com/lukemelas/EfficientNet-PyTorch/blob/master/efficientnet_pytorch/model.py#L231
-        endpoints = dict()
+        endpoints = dict() # 存储不同分辨率的特征图，供后续融合使用
 
-        # Stem
+        # 使用EfficientNet的Stem层进行初始特征提取
         x = self.trunk._swish(self.trunk._bn0(self.trunk._conv_stem(x)))  #  x: 24 x 32 x 64 x 176
         prev_x = x
 
         # Blocks
         for idx, block in enumerate(self.trunk._blocks):
             drop_connect_rate = self.trunk._global_params.drop_connect_rate
-            if drop_connect_rate:
+            if drop_connect_rate: # 正则化，降低过拟合风险
                 drop_connect_rate *= float(idx) / len(self.trunk._blocks) # scale drop connect_rate
             x = block(x, drop_connect_rate=drop_connect_rate)
             if prev_x.size(2) > x.size(2):
@@ -161,7 +162,8 @@ class LiftSplatShoot(nn.Module):
         ys = torch.linspace(0, ogfH - 1, fH, dtype=torch.float).view(1, fH, 1).expand(D, fH, fW)  # 在0到127上划分8个格子 ys: DxfHxfW(41x8x22)
 
         # D x H x W x 3
-        frustum = torch.stack((xs, ys, ds), -1)  # 堆积起来形成网格坐标, frustum[i,j,k,0]就是(i,j)位置，深度为k的像素的宽度方向上的栅格坐标   frustum: DxfHxfWx3
+        # 视锥点云的最后一维代表的就是点云的三维坐标 x y z
+        frustum = torch.stack((xs, ys, ds), -1)  
         return nn.Parameter(frustum, requires_grad=False)
 
     def get_geometry(self, rots, trans, intrins, post_rots, post_trans):
@@ -175,12 +177,15 @@ class LiftSplatShoot(nn.Module):
         # B x N x D x H x W x 3
         # 抵消数据增强及预处理对像素的变化
         points = self.frustum - post_trans.view(B, N, 1, 1, 1, 3)
+        # 在最后一维增加一个维度，方便和3 x 3矩阵相乘
+        # undo pose-rotation
         points = torch.inverse(post_rots).view(B, N, 1, 1, 1, 3, 3).matmul(points.unsqueeze(-1))
-
-        # cam_to_ego
-        points = torch.cat((points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3],
+        # points 维度 (B, N, 1, 1, 1, 3, 1)
+        # 相机坐标系变换到自车
+        points = torch.cat((points[:, :, :, :, :, :2] * points[:, :, :, :, :, 2:3], # 这里将u,v分别和d相乘，张量乘法
                             points[:, :, :, :, :, 2:3]
-                            ), 5)  # 将像素坐标(u,v,d)变成齐次坐标(du,dv,d)
+                            ), 5) # 合并最后一个维度，也就是索引5所在的维度，将最后一个维度重新变成3维的
+        # 将像素坐标(u,v,d)变成齐次坐标(du,dv,d)
         # d[u,v,1]^T=intrins*rots^(-1)*([x,y,z]^T-trans)
         combine = rots.matmul(torch.inverse(intrins))
         points = combine.view(B, N, 1, 1, 1, 3, 3).matmul(points).squeeze(-1)
@@ -265,7 +270,7 @@ class LiftSplatShoot(nn.Module):
         # post_rots: [4,6,3,3]
         # post_trans: [4,6,3]
         x = self.get_voxels(x, rots, trans, intrins, post_rots, post_trans)  # 将图像转换到BEV下，x: B x C x 200 x 200 (4 x 64 x 200 x 200)
-        x = self.bevencode(x)  # 用resnet18提取特征  x: 4 x 1 x 200 x 200
+        x = self.bevencode(x)  # 在bev下，用resnet18提取特征  x: 4 x 1 x 200 x 200
         return x
 
 
