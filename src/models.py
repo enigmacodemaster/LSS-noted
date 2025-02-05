@@ -127,10 +127,10 @@ class BevEncode(nn.Module):
 
         return x
 
-
-class LiftSplatShoot(nn.Module):
+# Lift Splat with no shoot
+class LiftSplat(nn.Module):
     def __init__(self, grid_conf, data_aug_conf, outC):
-        super(LiftSplatShoot, self).__init__()
+        super(LiftSplat, self).__init__()
         self.grid_conf = grid_conf   # 网格配置参数
         self.data_aug_conf = data_aug_conf   # 数据增强配置参数
 
@@ -140,7 +140,7 @@ class LiftSplatShoot(nn.Module):
                                               )  # 划分网格
         self.dx = nn.Parameter(dx, requires_grad=False)  # [0.5,0.5,20]
         self.bx = nn.Parameter(bx, requires_grad=False)  # [-49.5,-49.5,0]
-        self.nx = nn.Parameter(nx, requires_grad=False)  # [200,200,1]
+        self.nx = nn.Parameter(nx, requires_grad=False)  # [200,200,1] # 边界
 
         self.downsample = 16  # 下采样倍数
         self.camC = 64  # 图像特征维度
@@ -166,6 +166,7 @@ class LiftSplatShoot(nn.Module):
         frustum = torch.stack((xs, ys, ds), -1)  
         return nn.Parameter(frustum, requires_grad=False)
 
+    # 图像坐标系下的视锥点云转到自车
     def get_geometry(self, rots, trans, intrins, post_rots, post_trans):
         """Determine the (x,y,z) locations (in the ego frame)
         of the points in the point cloud.
@@ -204,7 +205,8 @@ class LiftSplatShoot(nn.Module):
         x = x.permute(0, 1, 3, 4, 5, 2)  # x: B x N x D x fH x fW x C(4 x 6 x 41 x 8 x 22 x 64)
 
         return x
-
+    
+    # splat操作
     def voxel_pooling(self, geom_feats, x):
         # geom_feats: B x N x D x H x W x 3 (4 x 6 x 41 x 8 x 22 x 3)
         # x: B x N x D x fH x fW x C(4 x 6 x 41 x 8 x 22 x 64)
@@ -213,13 +215,17 @@ class LiftSplatShoot(nn.Module):
         Nprime = B*N*D*H*W  # Nprime: 173184
 
         # flatten x
-        x = x.reshape(Nprime, C)  # 将图像展平，一共有 B*N*D*H*W 个点
+        x = x.reshape(Nprime, C)  # 将图像展平，一共有 B*N*D*H*W 个点 173184 x 64
 
-        # flatten indices
-        geom_feats = ((geom_feats - (self.bx - self.dx/2.)) / self.dx).long()  # 将[-50,50] [-10 10]的范围平移到[0,100] [0,20]，计算栅格坐标并取整
-        geom_feats = geom_feats.view(Nprime, 3)  # 将像素映射关系同样展平  geom_feats: B*N*D*H*W x 3 (173184 x 3)
+        # 将[-50,50] [-10 10]的范围平移到[0,100] [0,20]，计算体素栅格坐标并取整
+        geom_feats = ((geom_feats - (self.bx - self.dx/2.)) / self.dx).long() 
+        # 将像素映射关系同样展平  geom_feats: B*N*D*H*W x 3 (173184 x 3)
+        geom_feats = geom_feats.view(Nprime, 3)
+        # 创建一个张量，大小为[Nprime//B, 1]，全部填充为ix
+        # 每个批次索引 ix（从 0 到 B-1）都会生成一个包含批次索引的张量，构成一个列表
         batch_ix = torch.cat([torch.full([Nprime//B, 1], ix,
-                             device=x.device, dtype=torch.long) for ix in range(B)])  # 每个点对应于哪个batch
+                             device=x.device, dtype=torch.long) for ix in range(B)])  
+        # 确定每个点三维点属于哪个batch 批次
         geom_feats = torch.cat((geom_feats, batch_ix), 1)  # geom_feats: B*N*D*H*W x 4(173184 x 4), geom_feats[:,3]表示batch_id
 
         # filter out points that are outside box
@@ -228,18 +234,26 @@ class LiftSplatShoot(nn.Module):
             & (geom_feats[:, 1] >= 0) & (geom_feats[:, 1] < self.nx[1])\
             & (geom_feats[:, 2] >= 0) & (geom_feats[:, 2] < self.nx[2])
         x = x[kept]  # x: 168648 x 64
-        geom_feats = geom_feats[kept]
+        geom_feats = geom_feats[kept] # geom_feats: 168648 x 4
 
         # get tensors from the same voxel next to each other
+        # 权重系数 (self.nx[1] * self.nx[2] * B), (self.nx[2] * B), B 
+        # 分别用于确保 x、y、z 以及 batch_id 对应的rank产生不重叠的值，即唯一的rank。这相当于给每个点一个在整个批次和空间中唯一的坐标索引
+        # geom_feats[:, 0] : x坐标
+        # geom_feats[:, 1] : y坐标
+        # geom_feats[:, 2] : z坐标
+        # geom_feats[:, 3] : batch_id
         ranks = geom_feats[:, 0] * (self.nx[1] * self.nx[2] * B)\
             + geom_feats[:, 1] * (self.nx[2] * B)\
             + geom_feats[:, 2] * B\
             + geom_feats[:, 3]  # 给每一个点一个rank值，rank相等的点在同一个batch，并且在在同一个格子里面
         sorts = ranks.argsort()
-        x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]  # 按照rank排序，这样rank相近的点就在一起了
+        # 按照rank索引重新排序，这样rank相近的点就在一起了
+        x, geom_feats, ranks = x[sorts], geom_feats[sorts], ranks[sorts]  
         # x: 168648 x 64  geom_feats: 168648 x 4  ranks: 168648
 
         # cumsum trick
+        # 
         if not self.use_quickcumsum:
             x, geom_feats = cumsum_trick(x, geom_feats, ranks)
         else:
@@ -255,9 +269,10 @@ class LiftSplatShoot(nn.Module):
         return final  # final: 4 x 64 x 200 x 200
 
     def get_voxels(self, x, rots, trans, intrins, post_rots, post_trans):
+        # lift
         geom = self.get_geometry(rots, trans, intrins, post_rots, post_trans)  # 像素坐标到自车中坐标的映射关系 geom: B x N x D x H x W x 3 (4 x 6 x 41 x 8 x 22 x 3)
         x = self.get_cam_feats(x)  # 提取图像特征并预测深度编码 x: B x N x D x fH x fW x C(4 x 6 x 41 x 8 x 22 x 64)
-
+        # splat
         x = self.voxel_pooling(geom, x)  # x: 4 x 64 x 200 x 200
 
         return x
@@ -271,8 +286,9 @@ class LiftSplatShoot(nn.Module):
         # post_trans: [4,6,3]
         x = self.get_voxels(x, rots, trans, intrins, post_rots, post_trans)  # 将图像转换到BEV下，x: B x C x 200 x 200 (4 x 64 x 200 x 200)
         x = self.bevencode(x)  # 在bev下，用resnet18提取特征  x: 4 x 1 x 200 x 200
+        # 语义分割
         return x
 
 
 def compile_model(grid_conf, data_aug_conf, outC):
-    return LiftSplatShoot(grid_conf, data_aug_conf, outC)
+    return LiftSplat(grid_conf, data_aug_conf, outC)

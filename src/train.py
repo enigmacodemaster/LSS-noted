@@ -89,6 +89,7 @@ def train(version,  # 数据集的版本
 
             t0 = time()
             opt.zero_grad()
+            # 模型总共14.3M可训练参数
             preds = model(imgs.to(device),
                           rots.to(device),
                           trans.to(device),

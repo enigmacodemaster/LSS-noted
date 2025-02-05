@@ -182,9 +182,17 @@ def gen_dx_bx(xbound, ybound, zbound):  # 划分网格
 
 
 def cumsum_trick(x, geom_feats, ranks):
-    x = x.cumsum(0)
-    kept = torch.ones(x.shape[0], device=x.device, dtype=torch.bool)
-    kept[:-1] = (ranks[1:] != ranks[:-1])
+    # 沿x第一个维度累积和
+    # 对tensor([[1., 1., 1.],
+    #         [1., 1., 1.],
+    #         [1., 1., 1.]])
+    # 求cumsum，将得到
+    # tensor([[1., 1., 1.],
+    #         [2., 2., 2.],
+    #         [3., 3., 3.]])
+    x = x.cumsum(0) # x: 168648 x 64
+    kept = torch.ones(x.shape[0], device=x.device, dtype=torch.bool) # kept: 168648, 
+    kept[:-1] = (ranks[1:] != ranks[:-1]) # 一个true 和false 组成的向量，如果后一个元素和前一个元素相等，就是false，否则为true
 
     x, geom_feats = x[kept], geom_feats[kept]
     x = torch.cat((x[:1], x[1:] - x[:-1]))
@@ -201,7 +209,7 @@ class QuickCumsum(torch.autograd.Function):
         kept[:-1] = (ranks[1:] != ranks[:-1])  # 筛选出ranks中前后rank值不相等的位置
 
         x, geom_feats = x[kept], geom_feats[kept]  # rank值相等的点只留下最后一个，即一个batch中的一个格子里只留最后一个点 x: 29072  geom_feats: 29072 x 4
-        x = torch.cat((x[:1], x[1:] - x[:-1]))  # x后一个减前一个，还原到cumsum之前的x，此时的一个点是之前与其rank相等的点的feature的和，相当于把同一个格子的点特征进行了sum
+        x = torch.cat((x[:1], x[1:] - x[:-1]))  # x后一个减前一个，相当于对cumsum的操作做还原，此时的一个点是之前与其rank相等的点的feature的和，相当于把同一个格子的点特征进行了sum
 
         # save kept for backward
         ctx.save_for_backward(kept)
@@ -223,9 +231,9 @@ class QuickCumsum(torch.autograd.Function):
 
 
 class SimpleLoss(torch.nn.Module):
+    # sigmoid+二值交叉熵损失, pos_weight是给正样本乘的权重系数，防止正样本过少，用于平衡precision和recall
     def __init__(self, pos_weight):
         super(SimpleLoss, self).__init__()
-        # sigmoid+二值交叉熵损失, pos_weight是给正样本乘的权重系数，防止正样本过少，用于平衡precision和recall。
         self.loss_fn = torch.nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([pos_weight]))
 
     def forward(self, ypred, ytgt):

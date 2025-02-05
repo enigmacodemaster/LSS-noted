@@ -1,9 +1,3 @@
-"""
-Copyright (C) 2020 NVIDIA Corporation.  All rights reserved.
-Licensed under the NVIDIA Source Code License. See LICENSE at https://github.com/nv-tlabs/lift-splat-shoot.
-Authors: Jonah Philion and Sanja Fidler
-"""
-
 import torch
 import matplotlib as mpl
 
@@ -117,7 +111,8 @@ def lidar_check(version,
                 print('saving', imname)
                 plt.savefig(imname)
 
-
+# 观察模型在不同累积和计算方法（即常规累积和快速累积下）的行为
+# 尤其关注，在反向传播过程中对模型梯度的影响
 def cumsum_check(version,
                  dataroot='/data/nuscenes',
                  gpuid=1,
